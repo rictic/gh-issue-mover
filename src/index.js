@@ -5,7 +5,7 @@ import inquirer from 'inquirer';
 import 'colors';
 import open from 'open';
 import { pick } from 'lodash';
-import { fromRepoConfig, toRepoConfig } from './config.js';
+import { fromRepoConfig, toRepoConfig, userTokens } from './config.js';
 
 const fromGithub = new Octokat({
   token: fromRepoConfig.token,
@@ -17,6 +17,9 @@ const toGithub = new Octokat({
   rootURL: toRepoConfig.rootURL
 });
 
+const userGithubs = new Map(
+  (userTokens || []).map(({username, token}) => [username, new Octokat({token})]));
+
 const fromRepoName = `${fromRepoConfig.owner}/${fromRepoConfig.name}`;
 const toRepoName = `${toRepoConfig.owner}/${toRepoConfig.name}`;
 
@@ -24,42 +27,61 @@ const fromRepo = fromGithub.repos(fromRepoConfig.owner, fromRepoConfig.name);
 const toRepo = fromGithub.repos(toRepoConfig.owner, toRepoConfig.name);
 
 async function migrateComment(issue, comment) {
-  const authorshipNote = [
-    '---',
+  const {repo, body} = getBodyAndRepo(comment);
+  await repo.issues(issue.number).comments.create({body});
+}
+
+function fixupRepoLinks(markdownText) {
+  return markdownText.replace(
+      /(^|\s)#(\d+)(\s|$)/,
+      `$1https://github.com/${fromRepoName}/issues/$2$3`);
+}
+
+function getBodyAndRepo(migratingFrom) {
+  let body = migratingFrom.body;
+  body = fixupRepoLinks(body);
+
+  const userGithub = userGithubs.get(migratingFrom.user.login);
+  if (userGithub) {
+    body = [
+      body,
+      '',
+      `*Originally posted at ${new Date(migratingFrom.createdAt).toUTCString()} at ${migratingFrom.htmlUrl}*`,
+    ].join('\n');
+    const repo = userGithub.repos(toRepoConfig.owner, toRepoConfig.name);
+    return {body, repo, keepUser: true};
+  }
+
+  body = [
+    body,
     '',
-    `Migrated from ${comment.htmlUrl}`,
-    `Originally created by @${comment.user.login} on *${new Date(comment.createdAt).toUTCString()}*`,
-    '',
-    '---'
+    `*Originally posted by @${migratingFrom.user.login} at ${new Date(migratingFrom.createdAt).toUTCString()} at ${migratingFrom.htmlUrl}*`,
   ].join('\n');
-  const commentToCreate = {
-    body: `${authorshipNote}\n${comment.body}`
-  };
-  await toRepo.issues(issue.number).comments.create(commentToCreate);
+  return {body, repo: toRepo, keepUser: false};
 }
 
 async function migrateIssue(issue) {
-  const authorshipNote = [
-    '---',
-    '',
-    `Migrated from ${issue.htmlUrl}`,
-    `Originally created by @${issue.user.login} on *${new Date(issue.createdAt).toUTCString()}*`,
-    '',
-    '---'
-  ].join('\n');
+  const {body, repo} = getBodyAndRepo(issue);
   const issueToCreate = {
     ...pick(issue, ['title', 'labels']),
     assignees: issue.assignees.map(a => a.login),
-    body: `${authorshipNote}\n${issue.body}`
+    body
   };
+  issueToCreate.title = `[${fromRepoConfig.name}] ${issueToCreate.title}`;
   try {
-    const newIssue = await toRepo.issues.create(issueToCreate);
+    const newIssue = await repo.issues.create(issueToCreate);
     const comments = await fromRepo.issues(issue.number).comments.fetch();
-    await Promise.all(comments.map(c => migrateComment(newIssue, c)));
+    for (const comment of comments) {
+      await migrateComment(newIssue, comment);
+    }
     await fromRepo.issues(issue.number).comments.create({
       body: `Issue migrated to ${toRepoConfig.owner}/${toRepoConfig.name}#${newIssue.number}`
     });
     await fromRepo.issues(issue.number).update({ state: 'closed' });
+    if (issue.state === 'closed') {
+      const result = await toRepo.issues(newIssue.number).update(
+          { state: 'closed'});
+    }
     console.log(
       '\n',
       '🍭  Successfully migrated issue',
@@ -217,7 +239,7 @@ function clearConsole() {
 }
 
 try {
-  clearConsole();
+  // clearConsole();
   console.log('🖖  Greetings, hooman!\n')
   console.log(`🚚  Ready to migrate issues from ${fromRepoName.bold} to ${toRepoName.bold}?\n`);
   main();
