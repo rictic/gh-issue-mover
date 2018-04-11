@@ -9,7 +9,7 @@ import { fromRepoConfig, toRepoConfig, userTokens } from './config.js';
 
 const fromGithub = new Octokat({
   token: fromRepoConfig.token,
-  rootURL: fromRepoConfig.rootURL
+  rootURL: fromRepoConfig.rootURL,
 });
 
 const toGithub = new Octokat({
@@ -26,9 +26,29 @@ const toRepoName = `${toRepoConfig.owner}/${toRepoConfig.name}`;
 const fromRepo = fromGithub.repos(fromRepoConfig.owner, fromRepoConfig.name);
 const toRepo = fromGithub.repos(toRepoConfig.owner, toRepoConfig.name);
 
+const rateLimitCooldownSeconds = 65;
+function isRateLimitError(err) {
+  const limitUrl = "https://developer.github.com/v3/#abuse-rate-limits";
+  return err &&
+      err.status === 403 &&
+      err.json &&
+      err.json.documentation_url === limitUrl;
+}
+
 async function migrateComment(issue, comment) {
-  const {repo, body} = getBodyAndRepo(comment);
-  await repo.issues(issue.number).comments.create({body});
+  const {repo, github, body} = getBodyAndRepo(comment);
+  const {remaining} = await rateLimit(github);
+  try {
+    await repo.issues(issue.number).comments.create({body});
+  } catch (err) {
+    if (isRateLimitError(err)) {
+      await new Promise(
+          (resolve) => setTimeout(resolve, rateLimitCooldownSeconds * 1000));
+      await migrateComment(issue, comment);
+      return;
+    }
+    throw err;
+  }
 }
 
 function fixupRepoLinks(markdownText) {
@@ -49,7 +69,7 @@ function getBodyAndRepo(migratingFrom) {
       `*Originally posted at ${new Date(migratingFrom.createdAt).toUTCString()} at ${migratingFrom.htmlUrl}*`,
     ].join('\n');
     const repo = userGithub.repos(toRepoConfig.owner, toRepoConfig.name);
-    return {body, repo, keepUser: true};
+    return {body, repo, keepUser: true, github: userGithub};
   }
 
   body = [
@@ -57,7 +77,21 @@ function getBodyAndRepo(migratingFrom) {
     '',
     `*Originally posted by @${migratingFrom.user.login} at ${new Date(migratingFrom.createdAt).toUTCString()} at ${migratingFrom.htmlUrl}*`,
   ].join('\n');
-  return {body, repo: toRepo, keepUser: false};
+  return {body, repo: toRepo, keepUser: false, github: toGithub};
+}
+
+async function* getAllFromCollection(collection, options={}) {
+  let page = 1;
+  while (true) {
+    const batch = await collection.fetch({...options, page});
+    if (batch.length === 0) {
+      break;
+    }
+    for (const member of batch) {
+      yield member;
+    }
+    page++;
+  }
 }
 
 async function migrateIssue(issue) {
@@ -70,8 +104,8 @@ async function migrateIssue(issue) {
   issueToCreate.title = `[${fromRepoConfig.name}] ${issueToCreate.title}`;
   try {
     const newIssue = await repo.issues.create(issueToCreate);
-    const comments = await fromRepo.issues(issue.number).comments.fetch();
-    for (const comment of comments) {
+    const comments = getAllFromCollection(fromRepo.issues(issue.number).comments);
+    for await (const comment of comments) {
       await migrateComment(newIssue, comment);
     }
     await fromRepo.issues(issue.number).comments.create({
@@ -96,6 +130,49 @@ async function migrateIssue(issue) {
     console.log(`😱 Something went wrong while migrating issue #${issue.number}!`);
     console.log(JSON.stringify(e, null, 2));
   }
+}
+
+async function migrateAllIssues() {
+  const issuesIterator = getAllFromCollection(fromRepo.issues, {state: 'all'});
+  const issues = (await flattenAsyncIterator(issuesIterator)).filter(
+      (i) => !i.pullRequest);
+
+  console.log(`found ${issues.length} issues`);
+  issues.sort((a, b) => a.number - b.number);
+  for (const issue of issues) {
+    console.log(`[${issue.number}] ${issue.title}`);
+  }
+
+  const { confirm } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'confirm',
+    default: false,
+    message: [
+      `You're about to migrate`,
+      `${issues.length} issues.`.green,
+      'Are you sure?'
+    ].join(' ')
+  }]);
+  if (!confirm) {
+    return;
+  }
+  for (const issue of issues) {
+    const newIssue = await migrateIssue(issue);
+    if (!newIssue) {
+      console.log(`Failed to migrate issue #${issue.number}!`);
+      return;
+    }
+  }
+
+  console.log(`All issues migrated successfully!`);
+}
+
+async function flattenAsyncIterator(iter) {
+  const results = [];
+  for await (const val of iter) {
+    results.push(val);
+  }
+  return results;
 }
 
 async function migrateIssuesByLabel(labels) {
@@ -207,6 +284,9 @@ async function chooseMigrationType() {
     }, {
       name: 'by label',
       value: 'byLabel'
+    }, {
+      name: 'all (including closed)',
+      value: 'all'
     }]
   }]);
 
@@ -226,10 +306,13 @@ async function migrateIssues() {
   switch (migrationType) {
     case 'byLabel': await migrateIssuesByLabel(labels); break;
     case 'oneByOne': await migrateIssuesOneByOne(); break;
+    case 'all': await migrateAllIssues(); break;
   }
 }
 
 async function main() {
+  console.log('🖖  Greetings, hooman!\n')
+  console.log(`🚚  Ready to migrate issues from ${fromRepoName.bold} to ${toRepoName.bold}?\n`);
   await migrateIssues();
   console.log('\n👋  Ok! Goodbye!'.bold);
 }
@@ -238,11 +321,14 @@ function clearConsole() {
   process.stdout.write('\x1Bc');
 }
 
-try {
-  // clearConsole();
-  console.log('🖖  Greetings, hooman!\n')
-  console.log(`🚚  Ready to migrate issues from ${fromRepoName.bold} to ${toRepoName.bold}?\n`);
-  main();
-} catch (e) {
-  console.log(e);
+async function rateLimit(gitHub) {
+  const response = await gitHub.fromUrl('/rate_limit').fetch();
+  return response.resources.core; // {limit, remaining, reset}
 }
+
+
+main().catch((e) => {
+  e = e || 'Empty error';
+  console.error(e.stack || e);
+  process.exitCode = 1;
+});
