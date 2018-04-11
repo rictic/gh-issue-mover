@@ -9,9 +9,15 @@ const Repo = t.interface({
   rootURL: t.maybe(t.String)
 });
 
+const UserToken = t.interface({
+  username: t.String,
+  token: t.String
+});
+
 const Config = t.interface({
   fromRepo: Repo,
-  toRepo: Repo
+  toRepo: Repo,
+  userTokens: t.Any,
 });
 
 const { config: configPath } = argv;
@@ -64,4 +70,4 @@ if (!result.isValid()) {
   process.exit(1)
 }
 
-export const { fromRepo: fromRepoConfig, toRepo: toRepoConfig } = config;
+export const { fromRepo: fromRepoConfig, toRepo: toRepoConfig, userTokens } = config;
