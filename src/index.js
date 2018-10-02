@@ -104,7 +104,8 @@ async function migrateIssue(issue) {
   issueToCreate.title = `[${fromRepoConfig.name}] ${issueToCreate.title}`;
   try {
     const newIssue = await repo.issues.create(issueToCreate);
-    const comments = getAllFromCollection(fromRepo.issues(issue.number).comments);
+    const comments = getAllFromCollection(
+        fromRepo.issues(issue.number).comments);
     for await (const comment of comments) {
       await migrateComment(newIssue, comment);
     }
